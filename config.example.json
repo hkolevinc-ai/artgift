@@ -1,0 +1,47 @@
+{
+  "template_path": "template/TEMU_ARTGIFT_TEMPLATE.xlsx",
+  "output_dir": "output",
+  "categories": [
+    {
+      "url": "https://art-gift.net/тениски",
+      "slug": "тениски"
+    },
+    {
+      "url": "https://art-gift.net/бодита",
+      "slug": "бодита"
+    }
+  ],
+  "request_delay_seconds": 0.8,
+  "max_category_pages": 200,
+  "max_products": 15,
+  "rows_per_workbook": 1990,
+  "quantity": 100,
+  "shipping_template": "",
+  "handling_time": "2 Days",
+  "fulfillment_channel": "I will ship this item myself",
+  "country_of_origin": "Bulgaria",
+  "province_of_origin": "",
+  "manufacturer": "Webshop Bulgaria Ltd",
+  "eu_responsible_person": "",
+  "item_tax_code": "",
+  "product_guide_url": "",
+  "default_bodysuit_category": 26402,
+  "default_kids_tshirt_category": 30843,
+  "exact_variants_with_browser": true,
+  "browser_timeout_ms": 15000,
+  "fallback_to_colour_size_cross_product": true,
+  "packaging": {
+    "tshirt": {
+      "weight_g": 250,
+      "length_cm": 30,
+      "width_cm": 25,
+      "height_cm": 3
+    },
+    "bodysuit": {
+      "weight_g": 180,
+      "length_cm": 25,
+      "width_cm": 20,
+      "height_cm": 3
+    }
+  }
+}
