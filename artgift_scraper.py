@@ -109,6 +109,7 @@ class Variant:
     variation_id: str = ""
     price_eur: float | None = None
     images: list[str] = field(default_factory=list)
+    sleeve_raw: str = ""
 
 @dataclass
 class Product:
@@ -320,108 +321,190 @@ def extract_customization(soup: BeautifulSoup) -> tuple[bool, str]:
     return customizable, " | ".join(parts)[:1000]
 
 
-def static_variants(soup: BeautifulSoup, base_price: float) -> list[Variant]:
-    sizes: list[tuple[str, str]] = []
+def static_variants(soup: BeautifulSoup, base_price: float, product_kind: str) -> list[Variant]:
+    """Fallback parser for visible variation selectors.
+
+    T-shirts use main_filter=Size and add_filter=Color.
+    Bodysuits use main_filter=Sleeve and add_filter=Garment size.
+    """
+    main_options: list[tuple[str, str]] = []
     for a in soup.select("a.variations_products_links.main_filter"):
         value = normalize_space(a.get_text(" ", strip=True))
-        if value and value not in [x[0] for x in sizes]:
-            sizes.append((value, a.get("data-variation_id", "")))
-    colors: list[tuple[str, str]] = []
+        if value and value not in [x[0] for x in main_options]:
+            main_options.append((value, a.get("data-variation_id", "")))
+
+    add_options: list[tuple[str, str]] = []
     for a in soup.select("a.variations_products_links.add_filter"):
         value = normalize_space(a.get("title") or a.get_text(" ", strip=True))
-        if value and value not in [x[0] for x in colors]:
-            colors.append((value, a.get("data-variation_id", "")))
-    if not sizes:
-        sizes = [("One Size", "")]
-    if not colors:
-        colors = [("As shown", "")]
-    return [Variant(size, color, sid or cid, base_price) for size, sid in sizes for color, cid in colors]
+        if value and value not in [x[0] for x in add_options]:
+            add_options.append((value, a.get("data-variation_id", "")))
+
+    if product_kind == "bodysuit":
+        sizes = add_options or [("One Size", "")]
+        sleeves = main_options or [("Standard Sleeve", "")]
+        return [
+            Variant(size, "White", sleeve_id or size_id, base_price, sleeve_raw=sleeve)
+            for size, size_id in sizes
+            for sleeve, sleeve_id in sleeves
+        ]
+
+    sizes = main_options or [("One Size", "")]
+    colors = add_options or [("As shown", "")]
+    return [
+        Variant(size, color, size_id or color_id, base_price)
+        for size, size_id in sizes
+        for color, color_id in colors
+    ]
 
 
-def browser_variants(url: str, timeout_ms: int, base_price: float) -> list[Variant]:
-    """Enumerate exact offered size/colour combinations with the storefront browser.
+def browser_variants(url: str, timeout_ms: int, base_price: float, product_kind: str) -> list[Variant]:
+    """Enumerate the exact offered storefront variations with Playwright.
 
-    For each colour, the site refreshes the size anchors and embeds the matching
-    variation IDs in them. Reading those anchors is much faster than clicking every
-    individual size while still excluding combinations the site does not offer.
+    Selector roles differ by category:
+    - T-shirts: main_filter=Size, add_filter=Color.
+    - Bodysuits: main_filter=Sleeve, add_filter=Garment size.
+
+    Bodysuit price is read after clicking both size and sleeve because long-sleeve
+    variants may cost more than short-sleeve variants.
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError("Playwright is not installed") from exc
 
-    variants: dict[tuple[str, str], Variant] = {}
+    def stable_price(page: Any) -> float:
+        price_text = str(base_price)
+        if page.locator("#price").count():
+            last = None
+            stable_reads = 0
+            for _ in range(10):
+                current = page.locator("#price").input_value().strip()
+                if current and current == last:
+                    stable_reads += 1
+                    if stable_reads >= 2:
+                        price_text = current
+                        break
+                else:
+                    stable_reads = 0
+                if current:
+                    price_text = current
+                last = current
+                page.wait_for_timeout(250)
+        try:
+            return float(price_text.replace(",", "."))
+        except Exception:
+            return base_price
+
+    def option_names(page: Any, selector: str) -> list[str]:
+        return page.locator(selector).evaluate_all(
+            "els => els.filter(e => e.offsetParent !== null && !e.classList.contains('disabled'))"
+            ".map(e => (e.title || e.textContent || '').trim()).filter(Boolean)"
+        )
+
+    def click_option(page: Any, selector: str, name: str) -> bool:
+        is_active = page.evaluate(
+            """([selector,name]) => {
+                const e=[...document.querySelectorAll(selector)]
+                    .find(x => (x.title||x.textContent||'').trim()===name);
+                return !!(e && e.classList.contains('current_sell'));
+            }""",
+            [selector, name],
+        )
+        if is_active:
+            return True
+        clicked = page.evaluate(
+            """([selector,name]) => {
+                const e=[...document.querySelectorAll(selector)]
+                    .find(x => (x.title||x.textContent||'').trim()===name);
+                if(e){e.click(); return true;} return false;
+            }""",
+            [selector, name],
+        )
+        if not clicked:
+            return False
+        try:
+            page.wait_for_function(
+                """([selector,name]) => {
+                    const e=[...document.querySelectorAll(selector)]
+                        .find(x => (x.title||x.textContent||'').trim()===name);
+                    return !!(e && e.classList.contains('current_sell'));
+                }""",
+                [selector, name],
+                timeout=5000,
+            )
+        except Exception:
+            page.wait_for_timeout(800)
+        try:
+            page.wait_for_load_state("networkidle", timeout=2500)
+        except Exception:
+            pass
+        return True
+
+    variants: dict[tuple[str, str, str], Variant] = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(locale="bg-BG")
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_selector("a.variations_products_links", timeout=timeout_ms)
 
-        color_names = page.locator("a.variations_products_links.add_filter").evaluate_all(
-            "els => els.filter(e => e.offsetParent !== null).map(e => (e.title || e.textContent || '').trim()).filter(Boolean)"
-        )
-        if not color_names:
-            color_names = ["As shown"]
+        if product_kind == "bodysuit":
+            size_selector = "a.variations_products_links.add_filter"
+            sleeve_selector = "a.variations_products_links.main_filter"
+            size_names = option_names(page, size_selector) or ["One Size"]
 
-        for color_name in color_names:
-            if color_name != "As shown":
-                is_active = page.evaluate(
-                    "name => { const e=[...document.querySelectorAll('a.variations_products_links.add_filter')].find(x => (x.title||x.textContent||'').trim()===name); return !!(e && e.classList.contains('current_sell')); }",
-                    color_name,
-                )
-                if not is_active:
-                    clicked = page.evaluate(
-                        "name => { const e=[...document.querySelectorAll('a.variations_products_links.add_filter')].find(x => (x.title||x.textContent||'').trim()===name); if(e){e.click(); return true;} return false; }",
-                        color_name,
-                    )
-                    if not clicked:
+            for size_name in size_names:
+                if size_name != "One Size" and not click_option(page, size_selector, size_name):
+                    continue
+
+                sleeve_names = option_names(page, sleeve_selector) or ["Standard Sleeve"]
+                for sleeve_name in sleeve_names:
+                    if sleeve_name != "Standard Sleeve" and not click_option(page, sleeve_selector, sleeve_name):
                         continue
-                try:
-                    page.wait_for_function(
-                        "name => { const options=[...document.querySelectorAll('a.variations_products_links.add_filter')]; const target=options.find(x => (x.title||x.textContent||'').trim()===name); if(!target || !target.classList.contains('current_sell')) return false; const current=document.querySelector('#variation_id'); return !current || !target.dataset.variation_id || current.value===target.dataset.variation_id; }",
-                        color_name,
-                        timeout=4000,
+                    price = stable_price(page)
+                    image_urls = page.locator(".main_pic_container a.main_pic").evaluate_all(
+                        "els => els.map(e => e.href)"
                     )
-                except Exception:
-                    page.wait_for_timeout(700)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=2500)
-                except Exception:
-                    pass
+                    variation_id = (
+                        page.locator("#variation_id").input_value()
+                        if page.locator("#variation_id").count()
+                        else ""
+                    )
+                    variants[(size_name, "White", sleeve_name)] = Variant(
+                        size_name,
+                        "White",
+                        variation_id,
+                        price,
+                        image_urls,
+                        sleeve_raw=sleeve_name,
+                    )
+        else:
+            color_selector = "a.variations_products_links.add_filter"
+            size_selector = "a.variations_products_links.main_filter"
+            color_names = option_names(page, color_selector) or ["As shown"]
 
-            # The storefront updates the variation id before the displayed price.
-            # Read until the value is stable twice to avoid carrying over the
-            # previous colour's price on slow AJAX responses.
-            price_text = str(base_price)
-            if page.locator("#price").count():
-                last = None
-                stable_reads = 0
-                for _ in range(8):
-                    current = page.locator("#price").input_value().strip()
-                    if current and current == last:
-                        stable_reads += 1
-                        if stable_reads >= 2:
-                            price_text = current
-                            break
-                    else:
-                        stable_reads = 0
-                    if current:
-                        price_text = current
-                    last = current
-                    page.wait_for_timeout(250)
-            try:
-                price = float(price_text.replace(",", "."))
-            except Exception:
-                price = base_price
-            image_urls = page.locator(".main_pic_container a.main_pic").evaluate_all("els => els.map(e => e.href)")
-            sizes = page.locator("a.variations_products_links.main_filter").evaluate_all(
-                "els => els.filter(e => e.offsetParent !== null && !e.classList.contains('disabled')).map(e => ({size:(e.textContent||'').trim(), id:e.dataset.variation_id||''})).filter(x => x.size)"
-            )
-            if not sizes:
-                current_id = page.locator("#variation_id").input_value() if page.locator("#variation_id").count() else ""
-                sizes = [{"size": "One Size", "id": current_id}]
-            for item in sizes:
-                variants[(item["size"], color_name)] = Variant(item["size"], color_name, item["id"], price, image_urls)
+            for color_name in color_names:
+                if color_name != "As shown" and not click_option(page, color_selector, color_name):
+                    continue
+                price = stable_price(page)
+                image_urls = page.locator(".main_pic_container a.main_pic").evaluate_all(
+                    "els => els.map(e => e.href)"
+                )
+                sizes = page.locator(size_selector).evaluate_all(
+                    "els => els.filter(e => e.offsetParent !== null && !e.classList.contains('disabled'))"
+                    ".map(e => ({size:(e.textContent||'').trim(), id:e.dataset.variation_id||''}))"
+                    ".filter(x => x.size)"
+                )
+                if not sizes:
+                    current_id = (
+                        page.locator("#variation_id").input_value()
+                        if page.locator("#variation_id").count()
+                        else ""
+                    )
+                    sizes = [{"size": "One Size", "id": current_id}]
+                for item in sizes:
+                    variants[(item["size"], color_name, "")] = Variant(
+                        item["size"], color_name, item["id"], price, image_urls
+                    )
         browser.close()
     return list(variants.values())
 
@@ -447,42 +530,66 @@ def parse_product(html: str, url: str, product_kind: str, cfg: dict[str, Any]) -
     size_title = normalize_space(soup.select_one(".main_filter_title").get_text(" ", strip=True) if soup.select_one(".main_filter_title") else "")
     customizable, customization_text = extract_customization(soup)
     category_id = infer_category(url, title, size_title, product_kind, cfg)
-    variants = static_variants(soup, price)
+    variants = static_variants(soup, price, product_kind)
     return Product(url, site_id, code or site_id, title, description, short, category_id, product_kind,
                    size_title, images[:10], price, customizable, customization_text, variants)
 
 
+def normalize_sleeve(raw: str) -> tuple[str, str]:
+    text = normalize_space(raw).lower()
+    if "дъл" in text or "long" in text:
+        return "long-sleeve", "Дълъг ръкав"
+    if "къс" in text or "short" in text:
+        return "short-sleeve", "Къс ръкав"
+    return safe_slug(raw or "standard-sleeve", 20), normalize_space(raw or "Стандартен ръкав")
+
+
 def product_rows(product: Product, cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    parent_code = f"AG-{safe_slug(product.code or product.site_id, 60)}"
+    base_parent_code = f"AG-{safe_slug(product.code or product.site_id, 60)}"
     pack = cfg["packaging"][product.product_kind]
     custom_detail = product.customization_text or "Buyer can provide the personalization requested on the product page."
     bullet_custom = f"Customizable product: {custom_detail}"[:500]
     mark_customizable = bool(cfg.get("force_customizable", True) or product.customizable)
     rows: list[dict[str, Any]] = []
     seen_skus: set[str] = set()
+
     for idx, variant in enumerate(product.variants, start=1):
-        size_family, sub_size_family, size = map_size(variant.size_raw)
-        color = map_color(variant.color_raw)
+        if product.product_kind == "bodysuit":
+            sleeve_slug, sleeve_label = normalize_sleeve(variant.sleeve_raw)
+            parent_code = f"{base_parent_code}-{sleeve_slug}"[:90]
+            product_name = f"{product.title} – {sleeve_label}"[:500]
+            size_family, sub_size_family, size = map_size(variant.size_raw)
+            color = "White"
+            variation_bullet = "Each garment size is a separate SKU; sleeve type is grouped as a separate Temu product."
+        else:
+            parent_code = base_parent_code
+            product_name = product.title[:500]
+            size_family, sub_size_family, size = map_size(variant.size_raw)
+            color = map_color(variant.color_raw)
+            variation_bullet = "Each colour and size is a separate SKU"
+
         suffix = f"{safe_slug(color,18)}-{safe_slug(size,18)}"
         sku = f"{parent_code}-{suffix}"[:90]
         if sku in seen_skus:
             sku = f"{sku[:82]}-{idx:04d}"
         seen_skus.add(sku)
+
         price = variant.price_eur if variant.price_eur is not None else product.base_price_eur
         images = (variant.images or product.images)[:10]
         detail_images = product.images[:10]
+
         rows.append({
             "category": product.category_id,
             "product_type": "Custom product" if mark_customizable else "Normal product",
             "customization_mode": "Single technique" if mark_customizable else "",
             "primary_technique": "Leather/fabric customization technique" if mark_customizable else "",
             "secondary_technique": "Digital printing" if mark_customizable else "",
-            "product_name": product.title[:500],
+            "product_name": product_name,
             "parent_sku": parent_code,
             "sku": sku,
             "operation": "Add",
             "description": product.description,
-            "bullet_points": [bullet_custom, "Material: 100% cotton", "Direct digital print", "Each colour and size is a separate SKU"],
+            "bullet_points": [bullet_custom, "Material: 100% cotton", "Direct digital print", variation_bullet],
             "detail_images": detail_images,
             "variation_theme": "Color × Size",
             "size_family": size_family,
@@ -503,8 +610,6 @@ def product_rows(product: Product, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             "fulfillment_channel": cfg["fulfillment_channel"], "item_tax_code": cfg["item_tax_code"],
             "country_origin": cfg["country_of_origin"], "province_origin": cfg["province_of_origin"],
             "product_guide": cfg["product_guide_url"],
-            # Use the merchant SKU as the traceable product identification.
-            # Storefront variation IDs can repeat across colours on Art-Gift.
             "product_identification": sku,
             "manufacturer": cfg["manufacturer"], "eu_responsible_person": cfg["eu_responsible_person"],
         })
@@ -780,7 +885,7 @@ def run(config_path: Path) -> list[Path]:
             product = parse_product(source, url, kind, cfg)
             if cfg.get("exact_variants_with_browser"):
                 try:
-                    exact = browser_variants(url, int(cfg["browser_timeout_ms"]), product.base_price_eur)
+                    exact = browser_variants(url, int(cfg["browser_timeout_ms"]), product.base_price_eur, product.product_kind)
                     if exact:
                         product.variants = exact
                 except Exception as exc:
@@ -815,6 +920,7 @@ def run(config_path: Path) -> list[Path]:
         "workbooks": [str(p) for p in outputs], "failures": failures,
         "warnings": [
             "Packaging weight/dimensions are configurable defaults and must be verified.",
+            "Bodysuits are split into separate short-sleeve/long-sleeve Contribution Goods so Temu Size remains the garment size and Color remains White.",
             "Unisex bodysuits default to category 26402; review products that should use 26325.",
             "Shipping Template and EU Responsible person are store-specific and may need configuration.",
         ],

@@ -69,3 +69,18 @@ For validation, run `tshirts` with `max_products=10`, then `bodysuits` with
 The browser variation reader also waits for the selected colour and its price to
 settle before exporting the SKU rows. This prevents a previous colour's price
 from being reused during slow storefront updates.
+
+## Bodysuit variation handling (V3)
+
+Art-Gift bodysuits do not use the same selector layout as T-shirts. On bodysuits,
+the storefront's main selector is **sleeve length**, while the secondary selector
+contains the actual garment sizes (56, 62, 68, etc.). V3 handles this separately:
+
+- Temu **Size** receives the real garment size;
+- Temu **Color** is set to `White` because the tested bodysuits do not offer a colour selector;
+- short-sleeve and long-sleeve versions become separate **Contribution Goods**;
+- every garment size remains a separate **Contribution SKU**;
+- the price is read after both size and sleeve have been selected, so the long-sleeve surcharge is preserved.
+
+This split is necessary because the supplied Temu categories expose Size and Color
+as SKU-level sale properties, while sleeve length is a product-level property.
