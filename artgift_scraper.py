@@ -64,6 +64,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "exact_variants_with_browser": True,
     "browser_timeout_ms": 15000,
     "fallback_to_colour_size_cross_product": True,
+    "force_customizable": True,
     "packaging": {
         "tshirt": {"weight_g": 250, "length_cm": 30, "width_cm": 25, "height_cm": 3},
         "bodysuit": {"weight_g": 180, "length_cm": 25, "width_cm": 20, "height_cm": 3},
@@ -364,23 +365,50 @@ def browser_variants(url: str, timeout_ms: int, base_price: float) -> list[Varia
 
         for color_name in color_names:
             if color_name != "As shown":
-                before = page.locator("#variation_id").input_value() if page.locator("#variation_id").count() else ""
-                clicked = page.evaluate(
-                    "name => { const e=[...document.querySelectorAll('a.variations_products_links.add_filter')].find(x => (x.title||x.textContent||'').trim()===name); if(e){e.click(); return true;} return false; }",
+                is_active = page.evaluate(
+                    "name => { const e=[...document.querySelectorAll('a.variations_products_links.add_filter')].find(x => (x.title||x.textContent||'').trim()===name); return !!(e && e.classList.contains('current_sell')); }",
                     color_name,
                 )
-                if not clicked:
-                    continue
+                if not is_active:
+                    clicked = page.evaluate(
+                        "name => { const e=[...document.querySelectorAll('a.variations_products_links.add_filter')].find(x => (x.title||x.textContent||'').trim()===name); if(e){e.click(); return true;} return false; }",
+                        color_name,
+                    )
+                    if not clicked:
+                        continue
                 try:
                     page.wait_for_function(
-                        "v => !document.querySelector('#variation_id') || document.querySelector('#variation_id').value !== v",
-                        before,
-                        timeout=1800,
+                        "name => { const options=[...document.querySelectorAll('a.variations_products_links.add_filter')]; const target=options.find(x => (x.title||x.textContent||'').trim()===name); if(!target || !target.classList.contains('current_sell')) return false; const current=document.querySelector('#variation_id'); return !current || !target.dataset.variation_id || current.value===target.dataset.variation_id; }",
+                        color_name,
+                        timeout=4000,
                     )
                 except Exception:
-                    page.wait_for_timeout(300)
+                    page.wait_for_timeout(700)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=2500)
+                except Exception:
+                    pass
 
-            price_text = page.locator("#price").input_value() if page.locator("#price").count() else str(base_price)
+            # The storefront updates the variation id before the displayed price.
+            # Read until the value is stable twice to avoid carrying over the
+            # previous colour's price on slow AJAX responses.
+            price_text = str(base_price)
+            if page.locator("#price").count():
+                last = None
+                stable_reads = 0
+                for _ in range(8):
+                    current = page.locator("#price").input_value().strip()
+                    if current and current == last:
+                        stable_reads += 1
+                        if stable_reads >= 2:
+                            price_text = current
+                            break
+                    else:
+                        stable_reads = 0
+                    if current:
+                        price_text = current
+                    last = current
+                    page.wait_for_timeout(250)
             try:
                 price = float(price_text.replace(",", "."))
             except Exception:
@@ -429,6 +457,7 @@ def product_rows(product: Product, cfg: dict[str, Any]) -> list[dict[str, Any]]:
     pack = cfg["packaging"][product.product_kind]
     custom_detail = product.customization_text or "Buyer can provide the personalization requested on the product page."
     bullet_custom = f"Customizable product: {custom_detail}"[:500]
+    mark_customizable = bool(cfg.get("force_customizable", True) or product.customizable)
     rows: list[dict[str, Any]] = []
     seen_skus: set[str] = set()
     for idx, variant in enumerate(product.variants, start=1):
@@ -444,10 +473,10 @@ def product_rows(product: Product, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         detail_images = product.images[:10]
         rows.append({
             "category": product.category_id,
-            "product_type": "Custom product" if product.customizable else "Normal product",
-            "customization_mode": "Single technique" if product.customizable else "",
-            "primary_technique": "Leather/fabric customization technique" if product.customizable else "",
-            "secondary_technique": "Digital printing" if product.customizable else "",
+            "product_type": "Custom product" if mark_customizable else "Normal product",
+            "customization_mode": "Single technique" if mark_customizable else "",
+            "primary_technique": "Leather/fabric customization technique" if mark_customizable else "",
+            "secondary_technique": "Digital printing" if mark_customizable else "",
             "product_name": product.title[:500],
             "parent_sku": parent_code,
             "sku": sku,
@@ -474,7 +503,9 @@ def product_rows(product: Product, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             "fulfillment_channel": cfg["fulfillment_channel"], "item_tax_code": cfg["item_tax_code"],
             "country_origin": cfg["country_of_origin"], "province_origin": cfg["province_of_origin"],
             "product_guide": cfg["product_guide_url"],
-            "product_identification": variant.variation_id or sku,
+            # Use the merchant SKU as the traceable product identification.
+            # Storefront variation IDs can repeat across colours on Art-Gift.
+            "product_identification": sku,
             "manufacturer": cfg["manufacturer"], "eu_responsible_person": cfg["eu_responsible_person"],
         })
     return rows
@@ -774,8 +805,13 @@ def run(config_path: Path) -> list[Path]:
         outputs.append(path)
         logging.info("Saved %s with %d rows", path, len(row_chunk))
 
+    products_by_category: dict[str, int] = {}
+    for _, kind in product_sources:
+        products_by_category[kind] = products_by_category.get(kind, 0) + 1
+
     report = {
-        "products_found": len(product_sources), "sku_rows": len(all_rows),
+        "products_found": len(product_sources), "products_by_category": products_by_category,
+        "sku_rows": len(all_rows),
         "workbooks": [str(p) for p in outputs], "failures": failures,
         "warnings": [
             "Packaging weight/dimensions are configurable defaults and must be verified.",

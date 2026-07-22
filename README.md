@@ -53,3 +53,19 @@ The result is downloaded as the `artgift-temu-output` artifact.
 - Product prices are read from the site's EUR price field/structured data; no BGN conversion is performed.
 - Existing workbook formatting, formulas, dropdowns and validations are preserved through direct XLSX package editing.
 - A `run_report.json` file lists counts, output parts, failures and warnings.
+
+## Separate category tests
+
+The GitHub Actions form now has a **Category to scan** selector:
+
+- `tshirts` — scans only `Тениски`;
+- `bodysuits` — scans only `Бодита`;
+- `all` — scans both categories.
+
+For validation, run `tshirts` with `max_products=10`, then `bodysuits` with
+`max_products=10`. The generated `run_report.json` includes
+`products_by_category`, so it is immediately clear which category was scanned.
+
+The browser variation reader also waits for the selected colour and its price to
+settle before exporting the SKU rows. This prevents a previous colour's price
+from being reused during slow storefront updates.
