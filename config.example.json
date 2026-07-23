@@ -1,6 +1,10 @@
 {
   "template_path": "template/TEMU_ARTGIFT_TEMPLATE.xlsx",
   "output_dir": "output",
+  "manifest_path": "",
+  "product_offset": 0,
+  "product_limit": 0,
+  "output_prefix": "",
   "categories": [
     {
       "url": "https://art-gift.net/тениски",
@@ -13,7 +17,7 @@
   ],
   "request_delay_seconds": 0.8,
   "max_category_pages": 200,
-  "max_products": 15,
+  "max_products": 0,
   "rows_per_workbook": 1990,
   "quantity": 100,
   "shipping_template": "",

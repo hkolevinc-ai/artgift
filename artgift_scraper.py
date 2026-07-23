@@ -41,6 +41,10 @@ XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 DEFAULT_CONFIG: dict[str, Any] = {
     "template_path": "template/TEMU_ARTGIFT_TEMPLATE.xlsx",
     "output_dir": "output",
+    "manifest_path": "",
+    "product_offset": 0,
+    "product_limit": 0,
+    "output_prefix": "",
     "categories": [
         {"url": "https://art-gift.net/тениски", "slug": "тениски"},
         {"url": "https://art-gift.net/бодита", "slug": "бодита"},
@@ -900,14 +904,20 @@ def validate_config(cfg: dict[str, Any]) -> None:
         logging.warning("EU Responsible person is blank. Confirm whether Temu requires it for this seller/product setup.")
 
 
-def run(config_path: Path) -> list[Path]:
+def load_config(config_path: Path) -> dict[str, Any]:
     user_cfg = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
     cfg = deep_merge(DEFAULT_CONFIG, user_cfg)
     root = config_path.parent.resolve()
     cfg["template_path"] = str((root / cfg["template_path"]).resolve()) if not Path(cfg["template_path"]).is_absolute() else cfg["template_path"]
     cfg["output_dir"] = str((root / cfg["output_dir"]).resolve()) if not Path(cfg["output_dir"]).is_absolute() else cfg["output_dir"]
+    manifest_path = str(cfg.get("manifest_path") or "").strip()
+    if manifest_path and not Path(manifest_path).is_absolute():
+        cfg["manifest_path"] = str((root / manifest_path).resolve())
     validate_config(cfg)
+    return cfg
 
+
+def discover_product_sources(cfg: dict[str, Any]) -> list[tuple[str, str]]:
     session = make_session()
     product_sources: list[tuple[str, str]] = []
     for category in cfg["categories"]:
@@ -917,8 +927,84 @@ def run(config_path: Path) -> list[Path]:
     product_sources = list(dict.fromkeys(product_sources))
     if cfg.get("max_products"):
         product_sources = product_sources[: int(cfg["max_products"])]
-    logging.info("Total unique products: %d", len(product_sources))
+    return product_sources
 
+
+def products_by_category(product_sources: list[tuple[str, str]]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for _, kind in product_sources:
+        result[kind] = result.get(kind, 0) + 1
+    return result
+
+
+def save_manifest(config_path: Path, manifest_path: Path) -> Path:
+    cfg = load_config(config_path)
+    product_sources = discover_product_sources(cfg)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "products_found": len(product_sources),
+        "products_by_category": products_by_category(product_sources),
+        "products": [{"url": url, "kind": kind} for url, kind in product_sources],
+    }
+    manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logging.info("Saved manifest %s with %d products", manifest_path, len(product_sources))
+    return manifest_path
+
+
+def load_manifest(manifest_path: Path) -> list[tuple[str, str]]:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_products = payload.get("products", payload if isinstance(payload, list) else [])
+    product_sources: list[tuple[str, str]] = []
+    for item in raw_products:
+        if isinstance(item, dict):
+            url = str(item.get("url") or "").strip()
+            kind = str(item.get("kind") or "").strip()
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            url, kind = str(item[0]).strip(), str(item[1]).strip()
+        else:
+            continue
+        if url and kind in {"tshirt", "bodysuit"}:
+            product_sources.append((url, kind))
+    return list(dict.fromkeys(product_sources))
+
+
+def output_stem(prefix: str, base: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_-]+", "-", prefix.strip()).strip("-")
+    return f"{base}_{clean}" if clean else base
+
+
+def run(
+    config_path: Path,
+    *,
+    manifest_path: Path | None = None,
+    product_offset: int | None = None,
+    product_limit: int | None = None,
+    output_prefix: str | None = None,
+) -> list[Path]:
+    cfg = load_config(config_path)
+
+    configured_manifest = str(cfg.get("manifest_path") or "").strip()
+    effective_manifest = manifest_path or (Path(configured_manifest) if configured_manifest else None)
+    if effective_manifest:
+        product_sources_all = load_manifest(effective_manifest)
+        logging.info("Loaded %d products from manifest %s", len(product_sources_all), effective_manifest)
+    else:
+        product_sources_all = discover_product_sources(cfg)
+
+    total_discovered = len(product_sources_all)
+    offset = max(0, int(product_offset if product_offset is not None else cfg.get("product_offset", 0) or 0))
+    limit = max(0, int(product_limit if product_limit is not None else cfg.get("product_limit", 0) or 0))
+    end = min(total_discovered, offset + limit) if limit else total_discovered
+    product_sources = product_sources_all[offset:end]
+    logging.info(
+        "Selected product range %d:%d from %d discovered products (%d products in this batch)",
+        offset,
+        end,
+        total_discovered,
+        len(product_sources),
+    )
+
+    session = make_session()
     all_rows: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     for index, (url, kind) in enumerate(product_sources, start=1):
@@ -955,23 +1041,29 @@ def run(config_path: Path) -> list[Path]:
 
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = output_prefix if output_prefix is not None else str(cfg.get("output_prefix") or "")
+    workbook_stem = output_stem(prefix, "TEMU_ARTGIFT_UPLOAD")
+    report_stem = output_stem(prefix, "run_report")
+
     outputs: list[Path] = []
     for part, row_chunk in enumerate(chunks(all_rows, int(cfg["rows_per_workbook"])), start=1):
         writer = TemuWorkbookWriter(Path(cfg["template_path"]))
         writer.write_rows(row_chunk)
-        path = output_dir / f"TEMU_ARTGIFT_UPLOAD_part{part:02d}.xlsx"
+        path = output_dir / f"{workbook_stem}_part{part:02d}.xlsx"
         writer.save(path)
         outputs.append(path)
         logging.info("Saved %s with %d rows", path, len(row_chunk))
 
-    products_by_category: dict[str, int] = {}
-    for _, kind in product_sources:
-        products_by_category[kind] = products_by_category.get(kind, 0) + 1
-
     report = {
-        "products_found": len(product_sources), "products_by_category": products_by_category,
+        "products_discovered_total": total_discovered,
+        "product_offset": offset,
+        "product_limit": limit,
+        "product_range_end": end,
+        "products_found_in_batch": len(product_sources),
+        "products_by_category": products_by_category(product_sources),
         "sku_rows": len(all_rows),
-        "workbooks": [str(p) for p in outputs], "failures": failures,
+        "workbooks": [str(p) for p in outputs],
+        "failures": failures,
         "warnings": [
             "Packaging weight/dimensions are configurable defaults and must be verified.",
             "Bodysuits are split into separate short-sleeve/long-sleeve Contribution Goods; Temu Size remains the garment size, Color remains White, and Sleeve Length is populated.",
@@ -980,7 +1072,7 @@ def run(config_path: Path) -> list[Path]:
             "Shipping Template and EU Responsible person are store-specific and may need configuration.",
         ],
     }
-    (output_dir / "run_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_dir / f"{report_stem}.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return outputs
 
 
@@ -988,10 +1080,31 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("config.json"))
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    parser.add_argument("--discover-only", action="store_true", help="Discover product URLs and save a manifest without opening a browser.")
+    parser.add_argument("--manifest", type=Path, help="Manifest to write in discover mode or read in scrape mode.")
+    parser.add_argument("--product-offset", type=int, default=None, help="Zero-based start position inside the manifest.")
+    parser.add_argument("--product-limit", type=int, default=None, help="Number of products to process from the selected offset; 0 means all remaining.")
+    parser.add_argument("--output-prefix", default=None, help="Unique suffix used in workbook and report filenames.")
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s | %(levelname)s | %(message)s")
+
+    if args.discover_only:
+        manifest = args.manifest or Path("product_manifest.json")
+        try:
+            save_manifest(args.config, manifest)
+        except Exception:
+            logging.exception("Product discovery failed")
+            return 1
+        return 0
+
     try:
-        outputs = run(args.config)
+        outputs = run(
+            args.config,
+            manifest_path=args.manifest,
+            product_offset=args.product_offset,
+            product_limit=args.product_limit,
+            output_prefix=args.output_prefix,
+        )
     except Exception:
         logging.exception("Scraper failed")
         return 1
