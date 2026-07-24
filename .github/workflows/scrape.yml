@@ -1,0 +1,311 @@
+name: Art-Gift to Temu
+
+on:
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "Category to scan"
+        required: true
+        type: choice
+        default: "all"
+        options:
+          - all
+          - tshirts
+          - bodysuits
+      max_products:
+        description: "10-15 for a test; 0 for all products"
+        required: true
+        default: "0"
+      batch_size:
+        description: "Products per parallel job. Keep 20 unless a batch still approaches 6 hours."
+        required: true
+        default: "20"
+      shipping_template:
+        description: "Exact Temu shipping template name"
+        required: false
+        default: ""
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      product_count: ${{ steps.matrix.outputs.product_count }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install discovery dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare discovery configuration
+        env:
+          CATEGORY: ${{ inputs.category }}
+          MAX_PRODUCTS: ${{ inputs.max_products }}
+          SHIPPING_TEMPLATE: ${{ inputs.shipping_template }}
+        run: |
+          python - <<'PY'
+          import json, os
+
+          cfg = json.load(open('config.example.json', encoding='utf-8'))
+          selected = os.environ.get('CATEGORY', 'all')
+          slug_by_input = {'tshirts': 'тениски', 'bodysuits': 'бодита'}
+          if selected in slug_by_input:
+              wanted = slug_by_input[selected]
+              cfg['categories'] = [c for c in cfg['categories'] if c.get('slug') == wanted]
+          cfg['max_products'] = int(os.environ.get('MAX_PRODUCTS') or 0)
+          cfg['shipping_template'] = os.environ.get('SHIPPING_TEMPLATE', '')
+          cfg['output_dir'] = 'output'
+          json.dump(cfg, open('config.json', 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+          print('Selected category:', selected)
+          print('Configured category slugs:', [c['slug'] for c in cfg['categories']])
+          print('Maximum products:', cfg['max_products'])
+          PY
+
+      - name: Discover product URLs
+        run: python artgift_scraper.py --config config.json --discover-only --manifest product_manifest.json
+
+      - name: Build batch matrix
+        id: matrix
+        env:
+          BATCH_SIZE: ${{ inputs.batch_size }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          payload = json.loads(Path('product_manifest.json').read_text(encoding='utf-8'))
+          total = len(payload.get('products', []))
+          batch_size = max(1, int(os.environ.get('BATCH_SIZE') or 20))
+          if total == 0:
+              raise SystemExit('No products were discovered.')
+
+          include = []
+          for index, start in enumerate(range(0, total, batch_size), start=1):
+              include.append({
+                  'batch': f'{index:03d}',
+                  'offset': start,
+                  'limit': min(batch_size, total - start),
+              })
+
+          matrix = json.dumps({'include': include}, separators=(',', ':'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write(f'matrix={matrix}\n')
+              fh.write(f'product_count={total}\n')
+          print(f'Discovered {total} products; created {len(include)} batches of up to {batch_size}.')
+          PY
+
+      - name: Upload product manifest
+        uses: actions/upload-artifact@v6
+        with:
+          name: artgift-product-manifest-${{ github.run_id }}
+          path: product_manifest.json
+          if-no-files-found: error
+          retention-days: 3
+
+  scrape:
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies and Chromium
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Download product manifest
+        uses: actions/download-artifact@v5
+        with:
+          name: artgift-product-manifest-${{ github.run_id }}
+          path: work
+
+      - name: Prepare batch configuration
+        env:
+          CATEGORY: ${{ inputs.category }}
+          SHIPPING_TEMPLATE: ${{ inputs.shipping_template }}
+        run: |
+          python - <<'PY'
+          import json, os
+
+          cfg = json.load(open('config.example.json', encoding='utf-8'))
+          selected = os.environ.get('CATEGORY', 'all')
+          slug_by_input = {'tshirts': 'тениски', 'bodysuits': 'бодита'}
+          if selected in slug_by_input:
+              wanted = slug_by_input[selected]
+              cfg['categories'] = [c for c in cfg['categories'] if c.get('slug') == wanted]
+          cfg['max_products'] = 0
+          cfg['shipping_template'] = os.environ.get('SHIPPING_TEMPLATE', '')
+          cfg['output_dir'] = 'output'
+          json.dump(cfg, open('config.json', 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+          PY
+
+      - name: Run scraper batch ${{ matrix.batch }}
+        run: |
+          python artgift_scraper.py \
+            --config config.json \
+            --manifest work/product_manifest.json \
+            --product-offset ${{ matrix.offset }} \
+            --product-limit ${{ matrix.limit }} \
+            --output-prefix batch${{ matrix.batch }}
+
+      - name: Upload batch output
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: artgift-batch-${{ matrix.batch }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 14
+
+  finalize:
+    needs:
+      - discover
+      - scrape
+    if: always() && needs.discover.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download all completed batches
+        uses: actions/download-artifact@v5
+        with:
+          pattern: artgift-batch-*
+          path: final_output
+          merge-multiple: true
+
+      - name: Download product manifest
+        uses: actions/download-artifact@v5
+        with:
+          name: artgift-product-manifest-${{ github.run_id }}
+          path: manifest
+
+      - name: Build combined validation summary
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          import json
+          from collections import defaultdict
+          from pathlib import Path
+
+          root = Path('final_output')
+          reports = []
+          for path in sorted(root.glob('run_report_batch*.json')):
+              try:
+                  reports.append(json.loads(path.read_text(encoding='utf-8')))
+              except Exception as exc:
+                  print(f'Could not read {path}: {exc}')
+
+          manifest_path = Path('manifest/product_manifest.json')
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else {}
+
+          sku_to_urls = defaultdict(set)
+          parent_to_urls = defaultdict(set)
+          for report in reports:
+              for item in report.get('sku_index', []):
+                  sku_to_urls[str(item.get('sku') or '')].add(str(item.get('url') or ''))
+                  parent_to_urls[str(item.get('parent_sku') or '')].add(str(item.get('url') or ''))
+
+          duplicate_skus = [
+              {'sku': sku, 'urls': sorted(urls)}
+              for sku, urls in sku_to_urls.items()
+              if sku and len(urls) > 1
+          ]
+          parent_collisions = [
+              {'parent_sku': parent, 'urls': sorted(urls)}
+              for parent, urls in parent_to_urls.items()
+              if parent and len(urls) > 1
+          ]
+
+          failures = [failure for r in reports for failure in r.get('failures', [])]
+          critical_failures = [f for f in failures if '404 Client Error' not in str(f.get('error', ''))]
+          batch_validation_failures = [
+              {
+                  'batch_offset': r.get('product_offset'),
+                  'validation': r.get('validation', {}),
+              }
+              for r in reports
+              if not r.get('validation', {}).get('passed', False)
+          ]
+
+          excluded = list(manifest.get('excluded_during_discovery', []))
+          for report in reports:
+              excluded.extend(report.get('excluded_complex_sets_in_batch', []))
+          # De-duplicate excluded URLs.
+          excluded_by_url = {}
+          for item in excluded:
+              url = str(item.get('url') or '')
+              if url:
+                  excluded_by_url[url] = item
+          excluded = list(excluded_by_url.values())
+
+          with (root / 'excluded_products_all.csv').open('w', newline='', encoding='utf-8-sig') as fh:
+              writer = csv.DictWriter(fh, fieldnames=['url', 'title', 'code', 'kind', 'reason'])
+              writer.writeheader()
+              for item in excluded:
+                  writer.writerow({key: item.get(key, '') for key in writer.fieldnames})
+
+          ready = (
+              bool(reports)
+              and not duplicate_skus
+              and not parent_collisions
+              and not batch_validation_failures
+              and not critical_failures
+          )
+          summary = {
+              'ready_for_temu': ready,
+              'products_discovered_after_deduplication': manifest.get('products_found', 0),
+              'duplicate_category_paths_removed': len(manifest.get('duplicates_removed_during_discovery', [])),
+              'complex_sets_excluded': len(excluded),
+              'products_processed': sum(r.get('products_processed', 0) for r in reports),
+              'sku_rows': sum(r.get('sku_rows', 0) for r in reports),
+              'unique_skus': len([sku for sku in sku_to_urls if sku]),
+              'workbook_count': len(list(root.glob('TEMU_ARTGIFT_UPLOAD_batch*_part*.xlsx'))),
+              'batch_reports': len(reports),
+              'duplicate_skus': duplicate_skus,
+              'parent_collisions': parent_collisions,
+              'batch_validation_failures': batch_validation_failures,
+              'source_failures': failures,
+              'critical_failures': critical_failures,
+              'notes': [
+                  'Complex multi-garment sets are intentionally excluded and listed in excluded_products_all.csv.',
+                  '404 source pages cannot be exported and remain listed under source_failures.',
+              ],
+          }
+          (root / 'combined_run_report.json').write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          marker = 'READY_FOR_TEMU.txt' if ready else 'NOT_READY_FOR_TEMU.txt'
+          (root / marker).write_text(
+              'Validation passed. Review packaging defaults before upload.' if ready
+              else 'Validation failed. Review combined_run_report.json before upload.',
+              encoding='utf-8'
+          )
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final combined output
+        uses: actions/upload-artifact@v6
+        with:
+          name: artgift-temu-output-${{ inputs.category }}
+          path: final_output/
+          if-no-files-found: error
+          retention-days: 14
